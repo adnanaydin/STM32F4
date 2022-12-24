@@ -1,0 +1,374 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "io.h"
+#include "system.h"
+#include "uart.h"
+#include "fifo.h"
+#include "timer.h"
+#include "button.h"
+#include "oled.h"
+
+#define MB_DEVICE       0x01
+#define MB_TIMEOUT      1000
+
+#define MBU_BAUD        9600
+#define MBU_ST          USART2
+#define MBU_PORT        UART_2
+#define MBU_IRQn        USART2_IRQn
+#define MBU_IRQHandler  USART2_IRQHandler
+
+#define MBT_FREQ        SystemCoreClock
+#define MBT_TIMEOUT     1000
+#define MBT_PORT        TIMER_3
+#define MBT_ST          TIM3
+#define MBT_IRQHandler  TIM3_IRQHandler
+
+#define SZ_BUF          1024
+
+#define SZ_ADU          256
+#define SZ_PDU          253
+
+// Sorgu ve yanýt mesaj alanlarý
+static uint8_t _mb_req_adu[SZ_ADU];
+static uint8_t _mb_rsp_adu[SZ_ADU];
+
+// Sorgu ve yanýt mesajlarý uzunluðu (byte olarak)
+static uint8_t _mb_req_len;
+static uint8_t _mb_rsp_len;
+
+static unsigned char _RxBuf[SZ_BUF];
+static unsigned char _TxBuf[SZ_BUF];
+
+static FIFO     _RxFifo;
+static FIFO     _TxFifo;
+
+volatile int    g_TxFlag;
+
+////////////////////////////////////////////////////////////////////////////////
+
+void SwapUint16(void *buf)
+{
+  uint8_t temp;
+  uint8_t *pVal = (uint8_t *)buf;
+  
+  temp = pVal[0];
+  pVal[0] = pVal[1];
+  pVal[1] = temp;
+}
+
+/* Table of CRC values for high–order byte */
+static const uint8_t CRCtabHi[] = {
+0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0, 0x80, 0x41, 0x01, 0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81,
+0x40, 0x01, 0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81, 0x40, 0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0,
+0x80, 0x41, 0x01, 0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81, 0x40, 0x00, 0xC1, 0x81, 0x40, 0x01,
+0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0, 0x80, 0x41, 0x01, 0xC0, 0x80, 0x41,
+0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81, 0x40, 0x00, 0xC1, 0x81,
+0x40, 0x01, 0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0, 0x80, 0x41, 0x01, 0xC0,
+0x80, 0x41, 0x00, 0xC1, 0x81, 0x40, 0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0, 0x80, 0x41, 0x01,
+0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81, 0x40,
+0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0, 0x80, 0x41, 0x01, 0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81,
+0x40, 0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0,
+0x80, 0x41, 0x01, 0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81, 0x40, 0x00, 0xC1, 0x81, 0x40, 0x01,
+0xC0, 0x80, 0x41, 0x01, 0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0, 0x80, 0x41,
+0x00, 0xC1, 0x81, 0x40, 0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81,
+0x40, 0x01, 0xC0, 0x80, 0x41, 0x01, 0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0,
+0x80, 0x41, 0x00, 0xC1, 0x81, 0x40, 0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0, 0x80, 0x41, 0x01,
+0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81, 0x40, 0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0, 0x80, 0x41,
+0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0, 0x80, 0x41, 0x01, 0xC0, 0x80, 0x41, 0x00, 0xC1, 0x81,
+0x40
+};
+
+/* Table of CRC values for low–order byte */
+static const uint8_t CRCtabLo[] = {
+0x00, 0xC0, 0xC1, 0x01, 0xC3, 0x03, 0x02, 0xC2, 0xC6, 0x06, 0x07, 0xC7, 0x05, 0xC5, 0xC4,
+0x04, 0xCC, 0x0C, 0x0D, 0xCD, 0x0F, 0xCF, 0xCE, 0x0E, 0x0A, 0xCA, 0xCB, 0x0B, 0xC9, 0x09,
+0x08, 0xC8, 0xD8, 0x18, 0x19, 0xD9, 0x1B, 0xDB, 0xDA, 0x1A, 0x1E, 0xDE, 0xDF, 0x1F, 0xDD,
+0x1D, 0x1C, 0xDC, 0x14, 0xD4, 0xD5, 0x15, 0xD7, 0x17, 0x16, 0xD6, 0xD2, 0x12, 0x13, 0xD3,
+0x11, 0xD1, 0xD0, 0x10, 0xF0, 0x30, 0x31, 0xF1, 0x33, 0xF3, 0xF2, 0x32, 0x36, 0xF6, 0xF7,
+0x37, 0xF5, 0x35, 0x34, 0xF4, 0x3C, 0xFC, 0xFD, 0x3D, 0xFF, 0x3F, 0x3E, 0xFE, 0xFA, 0x3A,
+0x3B, 0xFB, 0x39, 0xF9, 0xF8, 0x38, 0x28, 0xE8, 0xE9, 0x29, 0xEB, 0x2B, 0x2A, 0xEA, 0xEE,
+0x2E, 0x2F, 0xEF, 0x2D, 0xED, 0xEC, 0x2C, 0xE4, 0x24, 0x25, 0xE5, 0x27, 0xE7, 0xE6, 0x26,
+0x22, 0xE2, 0xE3, 0x23, 0xE1, 0x21, 0x20, 0xE0, 0xA0, 0x60, 0x61, 0xA1, 0x63, 0xA3, 0xA2,
+0x62, 0x66, 0xA6, 0xA7, 0x67, 0xA5, 0x65, 0x64, 0xA4, 0x6C, 0xAC, 0xAD, 0x6D, 0xAF, 0x6F,
+0x6E, 0xAE, 0xAA, 0x6A, 0x6B, 0xAB, 0x69, 0xA9, 0xA8, 0x68, 0x78, 0xB8, 0xB9, 0x79, 0xBB,
+0x7B, 0x7A, 0xBA, 0xBE, 0x7E, 0x7F, 0xBF, 0x7D, 0xBD, 0xBC, 0x7C, 0xB4, 0x74, 0x75, 0xB5,
+0x77, 0xB7, 0xB6, 0x76, 0x72, 0xB2, 0xB3, 0x73, 0xB1, 0x71, 0x70, 0xB0, 0x50, 0x90, 0x91,
+0x51, 0x93, 0x53, 0x52, 0x92, 0x96, 0x56, 0x57, 0x97, 0x55, 0x95, 0x94, 0x54, 0x9C, 0x5C,
+0x5D, 0x9D, 0x5F, 0x9F, 0x9E, 0x5E, 0x5A, 0x9A, 0x9B, 0x5B, 0x99, 0x59, 0x58, 0x98, 0x88,
+0x48, 0x49, 0x89, 0x4B, 0x8B, 0x8A, 0x4A, 0x4E, 0x8E, 0x8F, 0x4F, 0x8D, 0x4D, 0x4C, 0x8C,
+0x44, 0x84, 0x85, 0x45, 0x87, 0x47, 0x46, 0x86, 0x82, 0x42, 0x43, 0x83, 0x41, 0x81, 0x80,
+0x40
+};
+
+// MODBUS 16-bit CRC fonksiyonu
+uint16_t CRC16(uint8_t *pMsg, uint8_t len)
+{
+  uint16_t crc = 0xFFFF;
+  uint8_t crcHi = crc >> 8; 	/* high byte of CRC initialized */
+  uint8_t crcLo = crc & 0xFF; /* low byte of CRC initialized */
+  uint8_t idx ; /* will index into CRC lookup table */
+
+  while (len--) 
+  {
+    idx = crcHi ^ *pMsg++ ; /* calculate the CRC */
+    crcHi = crcLo ^ CRCtabHi[idx];
+    crcLo = CRCtabLo[idx] ;
+  }
+
+  crc = ((uint16_t)crcHi << 8 | crcLo);
+  SwapUint16(&crc);  
+  
+  return crc;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+void MB_TimerInit(void)
+{
+  Timer_Init(MBT_PORT, 36, MBT_FREQ / MBU_BAUD, 1);
+  Timer_IntConfig(MBT_PORT, 4);
+}
+
+void MB_TimerStart(void)
+{
+  Timer_Reset(MBT_PORT);
+  Timer_Start(MBT_PORT, 1);
+}
+
+void MB_TimerStop(void)
+{
+  Timer_Start(MBT_PORT, 0);
+  Timer_Reset(MBT_PORT);
+}
+
+void MBT_IRQHandler(void)
+{
+  if (TIM_GetITStatus(MBT_ST, TIM_IT_Update)) {
+    _mb_rsp_len = FIFO_GetCount(&_RxFifo);
+    
+    MB_TimerStop();
+    TIM_ClearITPendingBit(MBT_ST, TIM_IT_Update);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+void MB_UartInit(int baud)
+{
+  // MB UART baþlangýç
+  UART_Init(MBU_PORT, baud);
+  
+  // FIFO baþlangýç
+  FIFO_Init(&_RxFifo, _RxBuf, SZ_BUF);
+  FIFO_Init(&_TxFifo, _TxBuf, SZ_BUF);
+  
+  // MB UART kesme ayarlarý
+  // a) ST yakasý
+  USART_ITConfig(MBU_ST, USART_IT_RXNE, ENABLE);
+  USART_ITConfig(MBU_ST, USART_IT_TXE, DISABLE);        // !! Kapalý baþlamalý
+  
+  // b) NVIC yakasý
+  NVIC_SetPriority(MBU_IRQn, 3);
+  NVIC_EnableIRQ(MBU_IRQn);
+}
+
+void MBU_IRQHandler(void)
+{
+  uint8_t c;
+  
+  if (USART_GetITStatus(MBU_ST, USART_IT_RXNE)) {
+    // Timer'ý durduruyoruz
+    MB_TimerStop();
+    
+    c = USART_ReceiveData(MBU_ST);
+    
+    FIFO_SetData(&_RxFifo, c);
+    
+    // Timer baþlatýlacak
+    MB_TimerStart();
+  }
+  
+  if (USART_GetITStatus(MBU_ST, USART_IT_TXE)) {
+    c = FIFO_GetData(&_TxFifo);
+    
+    USART_SendData(MBU_ST, c);
+    
+    // Gönderilecek veri kalmadýysa TXE kesme kaynaðý kapatýlmalý
+    // ve _txFlag sýfýrlanmalý
+    if (FIFO_IsEmpty(&_TxFifo)) {
+      USART_ITConfig(MBU_ST, USART_IT_TXE, DISABLE);
+      g_TxFlag = 0;
+    }
+  } 
+}
+
+// MB seri portundan verilen miktarda data gönderir (kesmeli)
+void MB_SendData(const void *buf, int len)
+{
+  const uint8_t *ptr = (const uint8_t *)buf;
+  
+  FIFO_Clear(&_TxFifo);
+  
+  while (!FIFO_IsFull(&_TxFifo) && len-- > 0)
+    FIFO_SetData(&_TxFifo, *ptr++);
+  
+  g_TxFlag = 1;
+  USART_ITConfig(MBU_ST, USART_IT_TXE, ENABLE);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+void MB_Init(void)
+{
+  MB_UartInit(MBU_BAUD);
+  
+  MB_TimerInit();
+}
+
+void MB_PrintADU(uint8_t *pAdu, int len)
+{
+  while (len--) 
+    printf("%02X ", *pAdu++); 
+  
+  printf("\n");
+}
+
+int MB_Request(uint8_t adr, uint8_t *mb_req_pdu, uint8_t mb_req_pdu_len)
+{
+  uint16_t crc;
+  
+  if (mb_req_pdu_len > SZ_PDU)
+    return 0;
+  
+  // PDU'yu ADU zarfýna yerleþtirmeliyiz
+  _mb_req_adu[0] = adr;
+  memcpy(_mb_req_adu + 1, mb_req_pdu, mb_req_pdu_len);
+  
+  crc = CRC16(_mb_req_adu, mb_req_pdu_len + 1);
+  *(uint16_t *)(_mb_req_adu + mb_req_pdu_len + 1) = crc;
+  
+  _mb_req_len = mb_req_pdu_len + 3;
+  MB_SendData(_mb_req_adu, _mb_req_len);
+  
+  // Test amaçlý
+  printf("(Q) ");
+  MB_PrintADU(_mb_req_adu, _mb_req_len);
+  
+  return 1;
+}
+
+// Geri dönüþ 0: hata, diðer baþarýlý ve pdu uzunluðu
+// parametre: cevabýn yükleneceði (response) buffer adresi
+int MB_Response(uint8_t *mb_rsp_adu)
+{
+  int i;
+  
+  if (_mb_rsp_len == 0)
+    return 0;
+  
+  for (i = 0; i < _mb_rsp_len; ++i)
+    _mb_rsp_adu[i] = FIFO_GetData(&_RxFifo);
+  
+  if (_mb_req_adu[0] != _mb_rsp_adu[0])
+    return -1;
+  
+  if (_mb_req_adu[1] != (_mb_rsp_adu[1] & 0x7F))
+      return -2;
+      
+  if (CRC16(_mb_rsp_adu, _mb_rsp_len))
+    return -3;
+      
+  memcpy(mb_rsp_adu, _mb_rsp_adu, _mb_rsp_len);
+  return _mb_rsp_len;
+}
+
+void Task_MB(void)
+{
+  static enum {
+    S_INIT,
+    S_WAIT_KEY,
+    S_REQUEST,
+    S_WAIT_RSP,
+    S_RESPONSE,
+    S_FUNCTION,
+  } state = S_INIT;
+  
+  static clock_t t0, t1;
+  static uint8_t mb_req_pdu[SZ_PDU];
+  //static uint8_t mb_rsp_pdu[SZ_PDU];
+  static uint8_t mb_rsp_adu[SZ_ADU];
+  //uint8_t mb_rsp_pdu_len;
+  uint8_t mb_rsp_adu_len;
+  //static uint32_t count;
+  
+  t1 = clock();
+  
+  switch (state) {
+  case S_INIT:
+    MB_Init();
+    
+    state = S_WAIT_KEY;
+    break;
+    
+  case S_WAIT_KEY:
+    if (g_sButtons[0]) {
+      g_sButtons[0] = 0;
+      
+      state = S_REQUEST;
+    }
+    break;
+    
+  case S_REQUEST:
+    _mb_rsp_len = 0;    // Response clear
+    
+    mb_req_pdu[0] = 0x03; // Read holding registers
+                          
+    // 40001 + adr
+    mb_req_pdu[1] = 0x00;
+    mb_req_pdu[2] = 0x65;
+
+    mb_req_pdu[3] = 0x00;
+    mb_req_pdu[4] = 0x05;
+
+    if (MB_Request(MB_DEVICE, mb_req_pdu, 5)) {
+      t0 = t1;
+      state = S_WAIT_RSP;
+    }
+    break;
+    
+  case S_WAIT_RSP:
+    if (_mb_rsp_len)
+      state = S_RESPONSE;
+    else if (t1 - t0 >= MB_TIMEOUT) {
+      //OLED_SetCursor(3, 0);
+      printf("(R) Timeout!\n");
+      state = S_WAIT_KEY;
+    }
+    break;
+    
+  case S_RESPONSE:
+    mb_rsp_adu_len = MB_Response(mb_rsp_adu);
+    
+    if (mb_rsp_adu_len > 0) {
+      //OLED_SetCursor(3, 0);
+      printf("(R) ");
+      MB_PrintADU(mb_rsp_adu, mb_rsp_adu_len);
+      state = S_FUNCTION;
+    }
+    else {
+      printf("Error: %d\n", mb_rsp_adu_len);    
+      state = S_WAIT_KEY;
+    }
+    break;
+    
+  case S_FUNCTION:
+    // Cevabý yorumla (iþle)
+    //...
+    state = S_WAIT_KEY;
+    break;
+  }
+}
+
